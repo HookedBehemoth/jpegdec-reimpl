@@ -1,7 +1,5 @@
 #pragma once
-
-#include <vapours/results.hpp>
-#include <switch/types.h>
+#include <stratosphere.hpp>
 
 namespace ams::jpegdec::impl {
 

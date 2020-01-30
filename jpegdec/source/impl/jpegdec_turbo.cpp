@@ -1,7 +1,7 @@
+#include <stratosphere.hpp>
 #include "jpegdec_turbo.hpp"
 
-#include <vapours/util/util_scope_guard.hpp>
-#include "jpeglib.h"
+#include <jpeglib.h>
 
 namespace ams::jpegdec::impl {
     
@@ -12,25 +12,22 @@ namespace ams::jpegdec::impl {
         cinfo.err = jpeg_std_error(&jerr);
         jpeg_create_decompress(&cinfo);
 
+        ON_SCOPE_EXIT {
+            jpeg_destroy_decompress(&cinfo);
+        };
+
         jpeg_mem_src(&cinfo, jpeg, jpegSize);
 
         int res = jpeg_read_header(&cinfo, true);
 
-        if (res != JPEG_HEADER_OK ||
-            cinfo.image_width != width ||
-            cinfo.image_height != height) {
-            jpeg_destroy_decompress(&cinfo);
-            return 0x4ce;
-        }
+        R_UNLESS(res == JPEG_HEADER_OK, 0x4ce);
+        R_UNLESS(cinfo.image_width == width, 0x4ce);
+        R_UNLESS(cinfo.image_height == height, 0x4ce);
 
         /* N only does RGBA */
         cinfo.out_color_space = JCS_EXT_RGBA;
         /* four byes per pixel RGBARGBA... */
         int row_stride = width * 4;
-        
-        /* Set output to the requested size */
-        cinfo.output_width = width;
-        cinfo.output_height = height;
 
         res = jpeg_start_decompress(&cinfo);
 
@@ -41,7 +38,6 @@ namespace ams::jpegdec::impl {
         }
 
         jpeg_finish_decompress(&cinfo);
-        jpeg_destroy_decompress(&cinfo);
 
         return ResultSuccess();
     }

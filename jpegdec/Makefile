@@ -4,6 +4,11 @@
 include $(dir $(abspath $(lastword $(MAKEFILE_LIST))))/../Atmosphere-libs/config/templates/stratosphere.mk
 
 #---------------------------------------------------------------------------------
+# atmosphere-fatal needs freetype.
+#---------------------------------------------------------------------------------
+LIBS     +=	-ljpeg
+
+#---------------------------------------------------------------------------------
 # no real need to edit anything past this point unless you need to add additional
 # rules for different file extensions
 #---------------------------------------------------------------------------------
