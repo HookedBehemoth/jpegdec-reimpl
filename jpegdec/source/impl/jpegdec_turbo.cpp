@@ -4,8 +4,8 @@
 #include <jpeglib.h>
 
 namespace ams::jpegdec::impl {
-    
-    Result DecodeJpeg(unsigned char* bmp, const u64 bmpSize, const unsigned char* jpeg, const u64 jpegSize, const u32 width, const u32 height) {
+
+    Result DecodeJpeg(u8* bmp, const u64 bmpSize, const u8* jpeg, const u64 jpegSize, const u32 width, const u32 height, const CapsScreenShotDecodeOption &opts) {
         struct jpeg_decompress_struct cinfo;
         struct jpeg_error_mgr jerr;
 
@@ -20,18 +20,27 @@ namespace ams::jpegdec::impl {
 
         int res = jpeg_read_header(&cinfo, true);
 
-        R_UNLESS(res == JPEG_HEADER_OK, 0x4ce);
-        R_UNLESS(cinfo.image_width == width, 0x4ce);
-        R_UNLESS(cinfo.image_height == height, 0x4ce);
+        R_UNLESS(res == JPEG_HEADER_OK, capsrv::ResultInvalidFileData());
+        R_UNLESS(cinfo.image_width == width, capsrv::ResultInvalidFileData());
+        R_UNLESS(cinfo.image_height == height, capsrv::ResultInvalidFileData());
 
-        /* N only does RGBA */
+        /* N only does RGB and defined pixelwidth to be 4. */
         cinfo.out_color_space = JCS_EXT_RGBA;
-        /* four byes per pixel RGBARGBA... */
-        int row_stride = width * 4;
+        cinfo.dct_method = JDCT_ISLOW;
+        cinfo.do_fancy_upsampling = opts.fancy_upsampling;
+        cinfo.do_block_smoothing = opts.block_smoothing;
 
         res = jpeg_start_decompress(&cinfo);
 
-        unsigned char *buffer_array[1];
+        R_UNLESS(res == TRUE, capsrv::ResultInvalidFileData());
+        R_UNLESS(cinfo.output_width == width, capsrv::ResultInvalidArgument());
+        R_UNLESS(cinfo.output_height == height, capsrv::ResultInvalidArgument());
+
+        /* four byes per pixel RGBARGBA... */
+        int row_stride = width * 4;
+
+        /* N does four lines at once */
+        u8 *buffer_array[1];
         while (cinfo.output_scanline < cinfo.output_height) {
             buffer_array[0] = bmp + cinfo.output_scanline * row_stride;
             jpeg_read_scanlines(&cinfo, buffer_array, 1);
