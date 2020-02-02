@@ -1,8 +1,7 @@
 #include <stratosphere.hpp>
 #include "jpegdec_decode_service.hpp"
+#include "impl/jpegdec_stb.hpp"
 #include "impl/jpegdec_turbo.hpp"
-
-#include <jpeglib.h>
 
 namespace ams::jpegdec {
 
@@ -23,7 +22,7 @@ namespace ams::jpegdec {
         R_UNLESS(jpeg != nullptr, capsrv::ResultInvalidFileData());
         R_UNLESS(jpegSize > 0, capsrv::ResultInvalidFileData());
 
-        Result rc = impl::DecodeJpeg(bmp, bmpSize, jpeg, jpegSize, width, height, opts);
+        Result rc = stb::DecodeJpeg(bmp, bmpSize, jpeg, jpegSize, width, height, opts);
         
         if (rc.IsFailure())
             memset(bmp, 0, bmpSize);
