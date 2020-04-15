@@ -22,7 +22,7 @@ extern "C" {
 }
 
 namespace ams {
-    ncm::ProgramId CurrentProgramId = ncm::ProgramId::JpegDec;
+    ncm::ProgramId CurrentProgramId = ncm::SystemProgramId::JpegDec;
 
     namespace result {
 

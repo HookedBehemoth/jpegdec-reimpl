@@ -1,11 +1,13 @@
-#include <stratosphere.hpp>
 #include "jpegdec_turbo.hpp"
 
+#include "../capsrv_results.hpp"
+
 #include <jpeglib.h>
+#include <stratosphere.hpp>
 
 namespace ams::jpegdec::impl {
 
-    Result DecodeJpeg(u8* bmp, const u64 bmpSize, const u8* jpeg, const u64 jpegSize, const u32 width, const u32 height, const CapsScreenShotDecodeOption &opts) {
+    Result DecodeJpeg(u8 *bmp, size_t bmpSize, const u8 *jpeg, size_t jpegSize, u32 width, u32 height, const CapsScreenShotDecodeOption &opts) {
         struct jpeg_decompress_struct cinfo;
         struct jpeg_error_mgr jerr;
 
