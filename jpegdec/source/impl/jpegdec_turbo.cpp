@@ -2,55 +2,279 @@
 
 #include "../capsrv_results.hpp"
 
-#include <jpeglib.h>
+/* STB image defines */
+#define STBI_NO_STDIO
+#define STBI_NEON
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_JPEG
+#define STBI_ASSERT(x) AMS_ASSERT(x)
+#include "stb_image.h"
+
 #include <stratosphere.hpp>
 
 namespace ams::jpegdec::impl {
 
-    Result DecodeJpeg(u8 *bmp, size_t bmpSize, const u8 *jpeg, size_t jpegSize, u32 width, u32 height, const CapsScreenShotDecodeOption &opts) {
-        struct jpeg_decompress_struct cinfo;
-        struct jpeg_error_mgr jerr;
+    namespace {
 
-        cinfo.err = jpeg_std_error(&jerr);
-        jpeg_create_decompress(&cinfo);
-
-        ON_SCOPE_EXIT {
-            jpeg_destroy_decompress(&cinfo);
-        };
-
-        jpeg_mem_src(&cinfo, jpeg, jpegSize);
-
-        int res = jpeg_read_header(&cinfo, true);
-
-        R_UNLESS(res == JPEG_HEADER_OK, capsrv::ResultInvalidFileData());
-        R_UNLESS(cinfo.image_width == width, capsrv::ResultInvalidFileData());
-        R_UNLESS(cinfo.image_height == height, capsrv::ResultInvalidFileData());
-
-        /* N only does RGB and defined pixelwidth to be 4. */
-        cinfo.out_color_space = JCS_EXT_RGBA;
-        cinfo.dct_method = JDCT_ISLOW;
-        cinfo.do_fancy_upsampling = opts.fancy_upsampling;
-        cinfo.do_block_smoothing = opts.block_smoothing;
-
-        res = jpeg_start_decompress(&cinfo);
-
-        R_UNLESS(res == TRUE, capsrv::ResultInvalidFileData());
-        R_UNLESS(cinfo.output_width == width, capsrv::ResultInvalidArgument());
-        R_UNLESS(cinfo.output_height == height, capsrv::ResultInvalidArgument());
-
-        /* four byes per pixel RGBARGBA... */
-        int row_stride = width * 4;
-
-        /* N does four lines at once */
-        u8 *buffer_array[1];
-        while (cinfo.output_scanline < cinfo.output_height) {
-            buffer_array[0] = bmp + cinfo.output_scanline * row_stride;
-            jpeg_read_scanlines(&cinfo, buffer_array, 1);
+        u8 *get_block(u8 *buffer, size_t mcu_x, size_t mcu_y, size_t width) {
+            return buffer + (width * 4 * mcu_y * 4 * 4) + (mcu_x * 8 * 4);
         }
 
-        jpeg_finish_decompress(&cinfo);
+        static int parse_entropy_coded_data(stbi__jpeg *z, u8 *buffer) {
+            stbi__jpeg_reset(z);
+            if (z->progressive) {
+                /* Unsupported */
+                return 0;
+            }
+            if (z->scan_n != 3) {
+                /* Unsupported */
+                return 0;
+            }
 
-        return ResultSuccess();
+            /* interleaved */
+            int i, j, k, x, y;
+            STBI_SIMD_ALIGN(short, data[64]);
+            constexpr const size_t block_count = 4;
+            constexpr const size_t block_size = 8 * 8;
+            stbi_uc block[block_count][block_size];
+
+            for (j = 0; j < z->img_mcu_y; ++j) {
+                for (i = 0; i < z->img_mcu_x; ++i) {
+                    // scan an interleaved mcu... process scan_n components in order
+                    u8 proc = 0;
+                    for (k = 0; k < z->scan_n; ++k) {
+                        int n = z->order[k];
+                        // scan out an mcu's worth of this component; that's just determined
+                        // by the basic H and V specified for the component
+                        for (y = 0; y < z->img_comp[n].v; ++y) {
+                            for (x = 0; x < z->img_comp[n].h; ++x) {
+                                int ha = z->img_comp[n].ha;
+                                if (!stbi__jpeg_decode_block(z, data, z->huff_dc + z->img_comp[n].hd, z->huff_ac + ha, z->fast_ac[ha], n, z->dequant[z->img_comp[n].tq]))
+                                    return 0;
+                                z->idct_block_kernel(block[proc], 8, data);
+                                proc++;
+                                /* Unsupported and unexpected */
+                                if (proc > block_count)
+                                    return 0;
+                            }
+                        }
+                    }
+                    u8 tmp[64 * 4] = {};
+                    u8 *src = tmp;
+                    u8 *dst = get_block(buffer, i, j, z->s->img_x);
+
+                    z->YCbCr_to_RGB_kernel(tmp, block[0], block[2], block[3], block_size, block_count);
+
+                    for (int d = 0; d < 8; d++) {
+                        if ((dst + 8 * 4) >= (buffer + z->s->img_x * z->s->img_y * 4)) {
+                            break;
+                        }
+                        std::memcpy(dst, src, 8 * 4);
+                        src += 8 * 4;
+                        dst += z->s->img_x * 4;
+                    }
+
+                    // after all interleaved components, that's an interleaved MCU,
+                    // so now count down the restart interval
+                    if (--z->todo <= 0) {
+                        if (z->code_bits < 24)
+                            stbi__grow_buffer_unsafe(z);
+                        if (!STBI__RESTART(z->marker))
+                            return 1;
+                        stbi__jpeg_reset(z);
+                    }
+                }
+            }
+            return 1;
+        }
+
+        static int process_frame_header(stbi__jpeg *z, int scan) {
+            stbi__context *s = z->s;
+            int Lf, p, i, q, h_max = 1, v_max = 1, c;
+            Lf = stbi__get16be(s);
+            if (Lf < 11)
+                return stbi__err("bad SOF len", "Corrupt JPEG"); // JPEG
+            p = stbi__get8(s);
+            if (p != 8)
+                return stbi__err("only 8-bit", "JPEG format not supported: 8-bit only"); // JPEG baseline
+            s->img_y = stbi__get16be(s);
+            if (s->img_y == 0)
+                return stbi__err("no header height", "JPEG format not supported: delayed height"); // Legal, but we don't handle it--but neither does IJG
+            s->img_x = stbi__get16be(s);
+            if (s->img_x == 0)
+                return stbi__err("0 width", "Corrupt JPEG"); // JPEG requires
+            c = stbi__get8(s);
+            if (c != 3 && c != 1 && c != 4)
+                return stbi__err("bad component count", "Corrupt JPEG");
+            s->img_n = c;
+            for (i = 0; i < c; ++i) {
+                z->img_comp[i].data = NULL;
+                z->img_comp[i].linebuf = NULL;
+            }
+
+            if (Lf != 8 + 3 * s->img_n)
+                return stbi__err("bad SOF len", "Corrupt JPEG");
+
+            z->rgb = 0;
+            for (i = 0; i < s->img_n; ++i) {
+                static const unsigned char rgb[3] = {'R', 'G', 'B'};
+                z->img_comp[i].id = stbi__get8(s);
+                if (s->img_n == 3 && z->img_comp[i].id == rgb[i])
+                    ++z->rgb;
+                q = stbi__get8(s);
+                z->img_comp[i].h = (q >> 4);
+                if (!z->img_comp[i].h || z->img_comp[i].h > 4)
+                    return stbi__err("bad H", "Corrupt JPEG");
+                z->img_comp[i].v = q & 15;
+                if (!z->img_comp[i].v || z->img_comp[i].v > 4)
+                    return stbi__err("bad V", "Corrupt JPEG");
+                z->img_comp[i].tq = stbi__get8(s);
+                if (z->img_comp[i].tq > 3)
+                    return stbi__err("bad TQ", "Corrupt JPEG");
+            }
+
+            if (scan != STBI__SCAN_load)
+                return 1;
+
+            if (!stbi__mad3sizes_valid(s->img_x, s->img_y, s->img_n, 0))
+                return stbi__err("too large", "Image too large to decode");
+
+            for (i = 0; i < s->img_n; ++i) {
+                if (z->img_comp[i].h > h_max)
+                    h_max = z->img_comp[i].h;
+                if (z->img_comp[i].v > v_max)
+                    v_max = z->img_comp[i].v;
+            }
+
+            // compute interleaved mcu info
+            z->img_h_max = h_max;
+            z->img_v_max = v_max;
+            z->img_mcu_w = h_max * 8;
+            z->img_mcu_h = v_max * 8;
+            // these sizes can't be more than 17 bits
+            z->img_mcu_x = (s->img_x + z->img_mcu_w - 1) / z->img_mcu_w;
+            z->img_mcu_y = (s->img_y + z->img_mcu_h - 1) / z->img_mcu_h;
+
+            for (i = 0; i < s->img_n; ++i) {
+                // number of effective pixels (e.g. for non-interleaved MCU)
+                z->img_comp[i].x = (s->img_x * z->img_comp[i].h + h_max - 1) / h_max;
+                z->img_comp[i].y = (s->img_y * z->img_comp[i].v + v_max - 1) / v_max;
+                // to simplify generation, we'll allocate enough memory to decode
+                // the bogus oversized data from using interleaved MCUs and their
+                // big blocks (e.g. a 16x16 iMCU on an image of width 33); we won't
+                // discard the extra data until colorspace conversion
+                //
+                // img_mcu_x, img_mcu_y: <=17 bits; comp[i].h and .v are <=4 (checked earlier)
+                // so these muls can't overflow with 32-bit ints (which we require)
+                z->img_comp[i].w2 = z->img_mcu_x * z->img_comp[i].h * 8;
+                z->img_comp[i].h2 = z->img_mcu_y * z->img_comp[i].v * 8;
+                z->img_comp[i].coeff = 0;
+                z->img_comp[i].raw_coeff = 0;
+                z->img_comp[i].linebuf = NULL;
+                // align blocks for idct using mmx/sse
+                z->img_comp[i].data = (stbi_uc *)(((size_t)z->img_comp[i].raw_data + 15) & ~15);
+                if (z->progressive) {
+                    return 0;
+                }
+            }
+
+            return 1;
+        }
+
+        static int decode_jpeg_header(stbi__jpeg *z, int scan) {
+            int m;
+            z->jfif = 0;
+            z->app14_color_transform = -1; // valid values are 0,1,2
+            z->marker = STBI__MARKER_none; // initialize cached marker to empty
+            m = stbi__get_marker(z);
+            if (!stbi__SOI(m))
+                return stbi__err("no SOI", "Corrupt JPEG");
+            if (scan == STBI__SCAN_type)
+                return 1;
+            m = stbi__get_marker(z);
+            while (!stbi__SOF(m)) {
+                if (!stbi__process_marker(z, m))
+                    return 0;
+                m = stbi__get_marker(z);
+                while (m == STBI__MARKER_none) {
+                    // some files have extra padding after their blocks, so ok, we'll scan
+                    if (stbi__at_eof(z->s))
+                        return stbi__err("no SOF", "Corrupt JPEG");
+                    m = stbi__get_marker(z);
+                }
+            }
+            z->progressive = stbi__SOF_progressive(m);
+            if (!process_frame_header(z, scan))
+                return 0;
+            return 1;
+        }
+
+        // decode image to YCbCr format
+        static int decode_jpeg_image(stbi__jpeg *j, u8 *buffer) {
+            int m;
+            for (m = 0; m < 4; m++) {
+                j->img_comp[m].raw_data = NULL;
+                j->img_comp[m].raw_coeff = NULL;
+            }
+            j->restart_interval = 0;
+            if (!decode_jpeg_header(j, STBI__SCAN_load))
+                return 0;
+            m = stbi__get_marker(j);
+            while (!stbi__EOI(m)) {
+                if (stbi__SOS(m)) {
+                    if (!stbi__process_scan_header(j))
+                        return 0;
+                    if (!parse_entropy_coded_data(j, buffer))
+                        return 0;
+                    if (j->marker == STBI__MARKER_none) {
+                        // handle 0s at the end of image data from IP Kamera 9060
+                        while (!stbi__at_eof(j->s)) {
+                            int x = stbi__get8(j->s);
+                            if (x == 255) {
+                                j->marker = stbi__get8(j->s);
+                                break;
+                            }
+                        }
+                        // if we reach eof without hitting a marker, stbi__get_marker() below will fail and we'll eventually return 0
+                    }
+                } else if (stbi__DNL(m)) {
+                    int Ld = stbi__get16be(j->s);
+                    stbi__uint32 NL = stbi__get16be(j->s);
+                    if (Ld != 4)
+                        return stbi__err("bad DNL len", "Corrupt JPEG");
+                    if (NL != j->s->img_y)
+                        return stbi__err("bad DNL height", "Corrupt JPEG");
+                } else {
+                    if (!stbi__process_marker(j, m))
+                        return 0;
+                }
+                m = stbi__get_marker(j);
+            }
+            if (j->progressive)
+                stbi__jpeg_finish(j);
+            return 1;
+        }
+
+        stbi__context g_ctx;
+        stbi__jpeg g_jpeg;
+
+    }
+
+    Result DecodeJpeg(u8 *bmp, size_t bmpSize, const u8 *jpeg, size_t jpegSize, u32 width, u32 height, const CapsScreenShotDecodeOption &opts) {
+        std::memset(&g_ctx, 0, sizeof(stbi__context));
+        stbi__start_mem(&g_ctx, jpeg, jpegSize);
+
+        std::memset(&g_jpeg, 0, sizeof(stbi__jpeg));
+        stbi__setup_jpeg(&g_jpeg);
+        ON_SCOPE_EXIT { stbi__cleanup_jpeg(&g_jpeg); };
+
+        g_jpeg.s = &g_ctx;
+
+        R_UNLESS(decode_jpeg_image(&g_jpeg, bmp) == 1, capsrv::ResultInvalidFileData());
+        R_UNLESS(g_jpeg.s->img_x == width, capsrv::ResultInvalidFileData());
+        R_UNLESS(g_jpeg.s->img_y == height, capsrv::ResultInvalidFileData());
+
+        return 0;
     }
 
 }
