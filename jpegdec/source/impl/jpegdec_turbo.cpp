@@ -37,8 +37,6 @@ namespace ams::jpegdec::impl {
                 r->ystep = r->vs >> 1;
                 r->w_lores = (8 + r->hs - 1) / r->hs;
 
-                std::printf("hs: %d, vs: %d\n", r->hs, r->vs);
-
                 if (r->hs == 1 && r->vs == 1) {
                     r->resample = resample_row_1;
                 } else if (r->hs == 1 && r->vs == 2) {
@@ -80,14 +78,12 @@ namespace ams::jpegdec::impl {
                                 proc++;
                                 /* Unsupported and unexpected */
                                 if (proc > 4) {
-                                    std::puts("Unsupported b");
                                     return 0;
                                 }
                             }
                         }
 
-                        stbi__resample *r = &res_comp[k];
-                        r->ypos = 0;
+                        res_comp[k].ypos = 0;
                     }
 
                     res_comp[0].line0 = res_comp[0].line1 = block[0];
@@ -104,20 +100,22 @@ namespace ams::jpegdec::impl {
                         stbi_uc *out = output + 4 * z->s->img_x * s;
                         /* Verify we don't write out of bounds. */
                         if ((out + block_width * 4) > (buffer + z->s->img_x * z->s->img_y * 4)) {
-                            std::printf("out of bounds: [%d:%d] 0x%lx\n", j, i, out - buffer);
                             break;
                         }
                         for (int k = 0; k < 3; ++k) {
                             stbi__resample *r = &res_comp[k];
                             int y_bot = r->ystep >= (r->vs >> 1);
-                            coutput[k] = r->resample(linebuffer[k],
-                                                     y_bot ? r->line1 : r->line0,
-                                                     y_bot ? r->line0 : r->line1,
-                                                     r->w_lores, r->hs);
+                            /* At block end don't resample color. */
+                            if (s != (block_height - 1) || k == 0) {
+                                coutput[k] = r->resample(linebuffer[k],
+                                                         y_bot ? r->line1 : r->line0,
+                                                         y_bot ? r->line0 : r->line1,
+                                                         r->w_lores, r->hs);
+                            }
                             if (++r->ystep >= r->vs) {
                                 r->ystep = 0;
                                 r->line0 = r->line1;
-                                if (++r->ypos < (8 * 8))
+                                if (++r->ypos < static_cast<int>(block_size))
                                     r->line1 += 8;
                             }
                         }
@@ -220,11 +218,10 @@ namespace ams::jpegdec::impl {
                 // so these muls can't overflow with 32-bit ints (which we require)
                 z->img_comp[i].w2 = z->img_mcu_x * z->img_comp[i].h * 8;
                 z->img_comp[i].h2 = z->img_mcu_y * z->img_comp[i].v * 8;
-                z->img_comp[i].coeff = 0;
-                z->img_comp[i].raw_coeff = 0;
-                z->img_comp[i].linebuf = NULL;
-                // align blocks for idct using mmx/sse
-                z->img_comp[i].data = (stbi_uc *)(((size_t)z->img_comp[i].raw_data + 15) & ~15);
+                /* We don't use those. */
+                z->img_comp[i].linebuf = nullptr;
+                z->img_comp[i].raw_data = z->img_comp[i].data = nullptr;
+                z->img_comp[i].raw_coeff = z->img_comp[i].coeff = nullptr;
                 if (z->progressive) {
                     return 0;
                 }
