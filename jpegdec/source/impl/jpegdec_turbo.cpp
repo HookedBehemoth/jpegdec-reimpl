@@ -16,62 +16,114 @@ namespace ams::jpegdec::impl {
 
     namespace {
 
-        u8 *get_block(u8 *buffer, size_t mcu_x, size_t mcu_y, size_t width) {
-            return buffer + (width * 4 * mcu_y * 4 * 4) + (mcu_x * 8 * 4);
-        }
-
         static int parse_entropy_coded_data(stbi__jpeg *z, u8 *buffer) {
             stbi__jpeg_reset(z);
-            if (z->progressive) {
+            if (z->progressive || z->scan_n != 3) {
                 /* Unsupported */
                 return 0;
             }
-            if (z->scan_n != 3) {
-                /* Unsupported */
-                return 0;
+            static u8 linebuffer[3][4 * 8];
+
+            stbi__resample res_comp[3];
+            u8 *coutput[4] = {NULL, NULL, NULL, NULL};
+            u16 block_width = 8;
+            u16 block_height = 8;
+
+            for (int k = 0; k < 3; k++) {
+                stbi__resample *r = &res_comp[k];
+
+                r->hs = z->img_h_max / z->img_comp[k].h;
+                r->vs = z->img_v_max / z->img_comp[k].v;
+                r->ystep = r->vs >> 1;
+                r->w_lores = (8 + r->hs - 1) / r->hs;
+
+                std::printf("hs: %d, vs: %d\n", r->hs, r->vs);
+
+                if (r->hs == 1 && r->vs == 1) {
+                    r->resample = resample_row_1;
+                } else if (r->hs == 1 && r->vs == 2) {
+                    r->resample = stbi__resample_row_v_2;
+                    block_width = 8;
+                    block_height = 16;
+                } else if (r->hs == 2 && r->vs == 1) {
+                    r->resample = stbi__resample_row_h_2;
+                    block_width = 16;
+                    block_height = 8;
+                    r->w_lores = (16 + r->hs - 1) / r->hs;
+                } else if (r->hs == 2 && r->vs == 2) {
+                    r->resample = z->resample_row_hv_2_kernel;
+                } else {
+                    r->resample = stbi__resample_row_generic;
+                }
             }
 
             /* interleaved */
-            int i, j, k, x, y;
             STBI_SIMD_ALIGN(short, data[64]);
             constexpr const size_t block_count = 4;
             constexpr const size_t block_size = 8 * 8;
-            stbi_uc block[block_count][block_size];
+            static stbi_uc block[block_count][block_size];
 
-            for (j = 0; j < z->img_mcu_y; ++j) {
-                for (i = 0; i < z->img_mcu_x; ++i) {
+            for (int j = 0; j < z->img_mcu_y; ++j) {
+                for (int i = 0; i < z->img_mcu_x; ++i) {
                     // scan an interleaved mcu... process scan_n components in order
                     u8 proc = 0;
-                    for (k = 0; k < z->scan_n; ++k) {
+                    for (int k = 0; k < 3; ++k) {
                         int n = z->order[k];
                         // scan out an mcu's worth of this component; that's just determined
                         // by the basic H and V specified for the component
-                        for (y = 0; y < z->img_comp[n].v; ++y) {
-                            for (x = 0; x < z->img_comp[n].h; ++x) {
+                        for (int y = 0; y < z->img_comp[n].v; ++y) {
+                            for (int x = 0; x < z->img_comp[n].h; ++x) {
                                 int ha = z->img_comp[n].ha;
                                 if (!stbi__jpeg_decode_block(z, data, z->huff_dc + z->img_comp[n].hd, z->huff_ac + ha, z->fast_ac[ha], n, z->dequant[z->img_comp[n].tq]))
                                     return 0;
                                 z->idct_block_kernel(block[proc], 8, data);
                                 proc++;
                                 /* Unsupported and unexpected */
-                                if (proc > block_count)
+                                if (proc > 4) {
+                                    std::puts("Unsupported b");
                                     return 0;
+                                }
                             }
                         }
+
+                        stbi__resample *r = &res_comp[k];
+                        r->ypos = 0;
                     }
-                    u8 tmp[64 * 4] = {};
-                    u8 *src = tmp;
-                    u8 *dst = get_block(buffer, i, j, z->s->img_x);
 
-                    z->YCbCr_to_RGB_kernel(tmp, block[0], block[2], block[3], block_size, block_count);
+                    res_comp[0].line0 = res_comp[0].line1 = block[0];
+                    res_comp[1].line0 = res_comp[1].line1 = block[2];
+                    res_comp[2].line0 = res_comp[2].line1 = block[3];
 
-                    for (int d = 0; d < 8; d++) {
-                        if ((dst + 8 * 4) >= (buffer + z->s->img_x * z->s->img_y * 4)) {
+                    u8 *output = buffer;
+                    /* Vertical block offset. */
+                    output += j * block_height * 4 * z->s->img_x;
+                    /* Horizontal block offset. */
+                    output += i * 4 * block_width;
+
+                    for (int s = 0; s < block_height; ++s) {
+                        stbi_uc *out = output + 4 * z->s->img_x * s;
+                        /* Verify we don't write out of bounds. */
+                        if ((out + block_width * 4) > (buffer + z->s->img_x * z->s->img_y * 4)) {
+                            std::printf("out of bounds: [%d:%d] 0x%lx\n", j, i, out - buffer);
                             break;
                         }
-                        std::memcpy(dst, src, 8 * 4);
-                        src += 8 * 4;
-                        dst += z->s->img_x * 4;
+                        for (int k = 0; k < 3; ++k) {
+                            stbi__resample *r = &res_comp[k];
+                            int y_bot = r->ystep >= (r->vs >> 1);
+                            coutput[k] = r->resample(linebuffer[k],
+                                                     y_bot ? r->line1 : r->line0,
+                                                     y_bot ? r->line0 : r->line1,
+                                                     r->w_lores, r->hs);
+                            if (++r->ystep >= r->vs) {
+                                r->ystep = 0;
+                                r->line0 = r->line1;
+                                if (++r->ypos < (8 * 8))
+                                    r->line1 += 8;
+                            }
+                        }
+                        u8 rgba[block_width * 4] = {};
+                        z->YCbCr_to_RGB_kernel(rgba, coutput[0], coutput[1], coutput[2], block_width, 4);
+                        std::memcpy(out, rgba, block_width * 4);
                     }
 
                     // after all interleaved components, that's an interleaved MCU,
